@@ -16,11 +16,17 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-model-loader.h"
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -153,6 +159,125 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     res &= pos->ne[0] == params.ubatch.n_tokens*n_pos_per_embd;
 
     return res;
+}
+
+bool llama_synthetic_routing(float * s, float * a0_per_k) {
+    static const std::array<float, 3> cfg = [] {
+        std::array<float, 3> out = {0.0f, 0.75f, 31.0f}; // on, s, a0 / k
+        if (!llama_synthetic_weights()) {
+            return out;
+        }
+        out[0] = 1.0f;
+        const char * v = getenv("LLAMA_SYNTHETIC_ROUTING");
+        if (v != nullptr && *v != '\0') {
+            if (strcmp(v, "off") == 0) {
+                out[0] = 0.0f;
+            } else if (sscanf(v, "%f,%f", &out[1], &out[2]) != 2 || out[1] < 0 || out[2] <= 0) {
+                LLAMA_LOG_WARN("%s: LLAMA_SYNTHETIC_ROUTING=%s is not \"s,a0/k\" or \"off\"; using 0.75,31\n", __func__, v);
+                out[1] = 0.75f;
+                out[2] = 31.0f;
+            }
+        }
+        return out;
+    }();
+    if (s) {
+        *s = cfg[1];
+    }
+    if (a0_per_k) {
+        *a0_per_k = cfg[2];
+    }
+    return cfg[0] != 0.0f;
+}
+
+namespace {
+
+// Drawn routings, made once per layer and micro-batch size and then reused in turn, so filling
+// the input costs a copy and the drawing is never inside a timed step.
+struct synthetic_routing_pool {
+    static constexpr int n_variants = 4;
+
+    std::mutex mu;
+    std::map<std::pair<int, int64_t>, std::vector<std::vector<int32_t>>> pools;
+    std::map<std::pair<int, int64_t>, int> next;
+
+    const std::vector<int32_t> & get(int il, int64_t n_tokens, int64_t n_expert, int64_t k) {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto key = std::make_pair(il, n_tokens);
+        auto it = pools.find(key);
+        if (it == pools.end()) {
+            it = pools.emplace(key, draw(il, n_tokens, n_expert, k)).first;
+        }
+        int & i = next[key];
+        const auto & out = it->second[i];
+        i = (i + 1) % n_variants;
+        return out;
+    }
+
+    static std::vector<std::vector<int32_t>> draw(int il, int64_t n_tokens, int64_t n_expert, int64_t k) {
+        float s = 0.75f, a0_per_k = 31.0f;
+        llama_synthetic_routing(&s, &a0_per_k);
+        std::mt19937_64 rng(0x5eed + (uint64_t) il * 7919);
+        // the layer's popularity profile, fixed for every micro-batch
+        std::vector<double> b(n_expert);
+        double sum = 0;
+        for (int64_t r = 0; r < n_expert; r++) {
+            b[r] = std::pow((double) (r + 1), -(double) s);
+            sum += b[r];
+        }
+        std::shuffle(b.begin(), b.end(), rng);
+        const double a0 = (double) a0_per_k * (double) k;
+        std::uniform_real_distribution<double> unif(1e-12, 1.0);
+        std::vector<std::vector<int32_t>> out(n_variants, std::vector<int32_t>(n_tokens * k));
+        std::vector<double> logp(n_expert), key(n_expert);
+        std::vector<int32_t> order(n_expert);
+        for (auto & ids : out) {
+            // this micro-batch's popularity: Dirichlet(a0 * b), from normalised gamma draws
+            double total = 0;
+            for (int64_t e = 0; e < n_expert; e++) {
+                std::gamma_distribution<double> gamma(std::max(a0 * b[e] / sum, 1e-6), 1.0);
+                logp[e] = gamma(rng);
+                total += logp[e];
+            }
+            for (int64_t e = 0; e < n_expert; e++) {
+                logp[e] = std::log(std::max(logp[e] / total, 1e-300));
+            }
+            // each token: k distinct experts in proportion to p (Gumbel top-k)
+            for (int64_t t = 0; t < n_tokens; t++) {
+                for (int64_t e = 0; e < n_expert; e++) {
+                    key[e] = logp[e] - std::log(-std::log(unif(rng)));
+                    order[e] = (int32_t) e;
+                }
+                std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                        [&](int32_t x, int32_t y) { return key[x] > key[y]; });
+                for (int64_t j = 0; j < k; j++) {
+                    ids[t * k + j] = order[j];
+                }
+            }
+        }
+        return out;
+    }
+};
+
+synthetic_routing_pool & routing_pool() {
+    static synthetic_routing_pool pool;
+    return pool;
+}
+
+} // namespace
+
+void llm_graph_input_synthetic_routing::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    const int64_t k = ids->ne[0], n_tokens = ids->ne[1];
+    staging.assign(ggml_nelements(ids), 0);
+    for (int il : layers) {
+        const auto & drawn = routing_pool().get(il, n_tokens, n_expert, k);
+        std::copy(drawn.begin(), drawn.end(), staging.begin() + (size_t) il * k * n_tokens);
+    }
+    ggml_backend_tensor_set(ids, staging.data(), 0, staging.size() * sizeof(int32_t));
+}
+
+bool llm_graph_input_synthetic_routing::can_reuse(const llm_graph_params & params) {
+    return params.ubatch.n_tokens == built_n_tokens && params.n_outputs == built_n_outputs;
 }
 
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
@@ -2054,6 +2179,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (selected_experts == nullptr) {
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
+    }
+    // synthetic weights: replace the selection, however it was made, with drawn routing. Only
+    // for micro-batches of more than one token: one token reads its k experts whichever they
+    // are, so decode's cost does not depend on the routing, and the drawn routing's input cost a
+    // decoded token about 0.3 ms (qwen3.5:35b, 3.43 -> 3.72 ms) that real decode does not pay.
+    if (llama_synthetic_routing(nullptr, nullptr) && ubatch.n_tokens > 1) {
+        if (inp_synthetic_routing == nullptr) {
+            auto inp = std::make_unique<llm_graph_input_synthetic_routing>(n_expert, n_expert_used, ubatch.n_tokens, n_outputs);
+            inp->ids = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_expert_used, ubatch.n_tokens, n_layer + n_layer_nextn);
+            ggml_set_input(inp->ids);
+            inp_synthetic_routing = inp.get();
+            res->add_input(std::move(inp));
+        }
+        auto * inp = inp_synthetic_routing;
+        // a layer whose shape differs from the first one's keeps its own routing
+        if (inp->n_expert == n_expert && inp->n_expert_used == n_expert_used && il >= 0 &&
+                il < inp->ids->ne[2] && n_tokens <= inp->ids->ne[1]) {
+            inp->layers.push_back(il);
+            // a view costs nothing and is a graph node, so an evaluation callback sees the selection
+            selected_experts = ggml_view_2d(ctx0, inp->ids, n_expert_used, n_tokens, inp->ids->nb[1], (size_t) il * inp->ids->nb[2]);
+        }
     }
     cb(selected_experts, "ffn_moe_topk", il);
 

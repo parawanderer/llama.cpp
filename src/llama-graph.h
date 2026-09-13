@@ -171,6 +171,44 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// synthetic weights: the experts each token is routed to, drawn instead of computed.
+// Made-up hidden states route unlike trained ones (too evenly in some architectures, collapsed
+// onto a few experts in others), and a mixture of experts' speed depends on its routing, so
+// under LLAMA_SYNTHETIC_WEIGHTS the selection is drawn from a distribution fitted to trained
+// routing: each layer has a fixed popularity profile, b_e proportional to rank^-s with the ranks
+// shuffled over the experts, each micro-batch draws p ~ Dirichlet(a0 * b), and each token picks
+// k distinct experts in proportion to p. LLAMA_SYNTHETIC_ROUTING="s,a0/k" sets the parameters
+// (default "0.75,31", from 22 trained models), or "off" keeps the model's own routing. Applied to
+// micro-batches of more than one token only: a single token's cost does not depend on which
+// experts it reads.
+class llm_graph_input_synthetic_routing : public llm_graph_input_i {
+public:
+    llm_graph_input_synthetic_routing(int64_t n_expert, int64_t n_expert_used, uint32_t built_n_tokens, uint32_t built_n_outputs)
+        : n_expert(n_expert), n_expert_used(n_expert_used), built_n_tokens(built_n_tokens), built_n_outputs(built_n_outputs) {}
+    virtual ~llm_graph_input_synthetic_routing() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // One tensor for every layer, I32 [n_expert_used, n_tokens, n_layers], filled in one copy per
+    // micro-batch: a copy per layer costs about 1 ms a decoded token on a 60-layer model. A layer
+    // reads the first rows of its slice (the last layer can compute the outputs only).
+    ggml_tensor * ids = nullptr;
+    std::vector<int> layers; // the layers that route through it
+
+    const int64_t  n_expert;
+    const int64_t  n_expert_used;
+    const uint32_t built_n_tokens;
+    const uint32_t built_n_outputs;
+
+private:
+    std::vector<int32_t> staging;
+};
+
+// whether synthetic routing is on, and its parameters (s, a0 / k)
+bool llama_synthetic_routing(float * s, float * a0_per_k);
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
@@ -1033,6 +1071,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // synthetic weights: the shared routing input, made by the first expert layer that needs it
+    mutable llm_graph_input_synthetic_routing * inp_synthetic_routing = nullptr;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
