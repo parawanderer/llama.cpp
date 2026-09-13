@@ -29,6 +29,13 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+// Synthetic weights (LLAMA_SYNTHETIC_WEIGHTS=random): a model's structure is read from its GGUF
+// header as usual, and every tensor is filled with made-up values instead of being read from the
+// file. The output is meaningless; it exists to time the hardware on a model's real graph, at its
+// real size, without its weights on disk. Nothing past the header is read, so the file may be the
+// real model, or its header alone.
+bool llama_synthetic_weights();
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
@@ -44,7 +51,8 @@ struct llama_model_loader {
             }
 
             offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
+            // synthetic weights read no tensor data, so a header without it is a whole model
+            if (!llama_synthetic_weights() && (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size())) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }

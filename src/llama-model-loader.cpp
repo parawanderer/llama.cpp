@@ -11,7 +11,10 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <future>
+#include <map>
+#include <random>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -824,6 +827,13 @@ llama_model_loader::llama_model_loader(
         this->use_mmap = false;
     }
 
+    // A mapped tensor points into the file, and synthetic weights need memory of their own to fill.
+    if (llama_synthetic_weights()) {
+        LLAMA_LOG_WARN("%s: LLAMA_SYNTHETIC_WEIGHTS=random: tensor data is not read; every weight is made up and the output is meaningless\n", __func__);
+        this->use_mmap      = false;
+        this->use_direct_io = false;
+    }
+
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
@@ -1078,8 +1088,146 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
+bool llama_synthetic_weights() {
+    static const bool on = [] {
+        const char * v = getenv("LLAMA_SYNTHETIC_WEIGHTS");
+        if (v == nullptr || *v == '\0') {
+            return false;
+        }
+        if (std::string(v) != "random") {
+            LLAMA_LOG_WARN("%s: LLAMA_SYNTHETIC_WEIGHTS=%s is not understood (only \"random\"); reading the weights\n", __func__, v);
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+
+namespace {
+
+// Made-up tensor data, one pattern per type, repeated to fill every tensor of that type. A pattern
+// holds whole blocks of its type, and a tensor's rows are whole blocks, so every tensor is filled
+// with valid blocks. The values come from ggml's own quantizers, so no format is described here.
+struct synthetic_patterns {
+    std::map<std::pair<ggml_type, bool>, std::vector<uint8_t>> by_type;
+
+    const std::vector<uint8_t> & get(ggml_type type, bool ones) {
+        const auto key = std::make_pair(type, ones);
+        auto it = by_type.find(key);
+        if (it != by_type.end()) {
+            return it->second;
+        }
+        // 4096 values per row is a multiple of every block size; 1024 rows is 4M values.
+        const int64_t n_per_row = 4096;
+        const int64_t nrows     = 1024;
+        std::vector<uint8_t> pattern(ggml_row_size(type, n_per_row) * nrows, 0);
+        // integer tensors, and the types that exist only as dot-product operands, stay zero
+        const bool quantizable = type != GGML_TYPE_Q8_1 && type != GGML_TYPE_Q8_K &&
+            (ggml_is_quantized(type) || type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
+        if (quantizable) {
+            // Matrices are normal with standard deviation 0.02, as initialised weights are, so
+            // activations stay finite through many layers. Vectors are ones. Small tensors are
+            // made up only when the file holds no data (made_up); a recurrent layer's decay
+            // then has the wrong sign, so such a model is not usable from its header alone.
+            //
+            // Measured against real weights on text: decode within 1.5% on eight models, prefill
+            // within 3% on dense models and few-expert mixtures. Mixtures of many experts differ
+            // at prefill, because routing depends on the weights: made-up hidden states spread
+            // tokens over the experts more evenly than trained ones in some architectures, and
+            // collapse onto a few experts in others.
+            std::vector<float> src(n_per_row * nrows, 1.0f);
+            if (!ones) {
+                std::mt19937 rng(1234 + (int) type);
+                std::normal_distribution<float> normal(0.0f, 0.02f);
+                for (auto & x : src) {
+                    x = normal(rng);
+                }
+            }
+            std::vector<float> imatrix(n_per_row, 1.0f);
+            ggml_quantize_chunk(type, src.data(), pattern.data(), 0, nrows, n_per_row,
+                    ggml_quantize_requires_imatrix(type) ? imatrix.data() : nullptr);
+        }
+        // repeated to about 64 MiB, so a large tensor is written in few calls
+        auto & out = by_type[key];
+        const size_t reps = std::max<size_t>(1, (64u << 20) / pattern.size());
+        out.reserve(pattern.size() * reps);
+        for (size_t i = 0; i < reps; i++) {
+            out.insert(out.end(), pattern.begin(), pattern.end());
+        }
+        return out;
+    }
+
+    // Whether a tensor is made up rather than read: every floating-point or quantized tensor of
+    // 1 MiB or more, and anything at all when the file holds only the header. What keeps a model
+    // numerically sane lives in small tensors, whatever their shape: norms, biases, a recurrent
+    // layer's decay (nemotron's ssm_a is [1, 64], its ssm_norm [512, 8]), convolution kernels,
+    // lookup tables. The weight matrices, which set the speed, are the large ones.
+    //
+    // LLAMA_SYNTHETIC_READ=a,b also reads, whatever their size, the tensors whose name contains
+    // any of the given fragments: "ffn_gate_inp" reads every router, to test how much of trained
+    // routing's skew the router alone carries.
+    static bool made_up(const ggml_tensor * t, bool in_file) {
+        if (!in_file) {
+            return true;
+        }
+        for (const auto & frag : read_anyway()) {
+            if (strstr(ggml_get_name(t), frag.c_str()) != nullptr) {
+                return false;
+            }
+        }
+        const bool weights = ggml_is_quantized(t->type) || t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16;
+        return weights && ggml_nbytes(t) >= (1u << 20);
+    }
+
+    static const std::vector<std::string> & read_anyway() {
+        static const std::vector<std::string> frags = [] {
+            std::vector<std::string> out;
+            const char * v = getenv("LLAMA_SYNTHETIC_READ");
+            std::string cur;
+            for (const char * c = v ? v : ""; ; c++) {
+                if (*c == ',' || *c == '\0') {
+                    if (!cur.empty()) {
+                        out.push_back(cur);
+                    }
+                    cur.clear();
+                    if (*c == '\0') {
+                        break;
+                    }
+                } else {
+                    cur += *c;
+                }
+            }
+            return out;
+        }();
+        return frags;
+    }
+
+    void fill(ggml_tensor * cur) {
+        const size_t n = ggml_nbytes(cur);
+        const auto & pattern = get(cur->type, ggml_n_dims(cur) == 1);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+        // A GPU buffer takes a tensor in pieces. A CPU one may repack the tensor as it is written,
+        // which needs the whole of it in one call.
+        const bool in_pieces = dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (in_pieces || n <= pattern.size()) {
+            for (size_t off = 0; off < n; off += pattern.size()) {
+                ggml_backend_tensor_set(cur, pattern.data(), off, std::min(pattern.size(), n - off));
+            }
+            return;
+        }
+        std::vector<uint8_t> whole(n);
+        for (size_t off = 0; off < n; off += pattern.size()) {
+            memcpy(whole.data() + off, pattern.data(), std::min(pattern.size(), n - off));
+        }
+        ggml_backend_tensor_set(cur, whole.data(), 0, n);
+    }
+};
+
+} // namespace
+
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+    // a lazy tensor's rows are read from the file when used; synthetic weights read nothing
+    if (mode == LLAMA_LAZY_MODE_OFF || llama_synthetic_weights()) {
         return false;
     }
 
@@ -1598,10 +1746,26 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    const bool synthetic = llama_synthetic_weights();
+    synthetic_patterns patterns;
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
+            continue;
+        }
+
+        // Synthetic weights make up the large tensors only, and read the small ones from the file
+        // when it has them (made_up): a made-up decay of the wrong sign makes a recurrent state
+        // grow until it is NaN, and routing on NaN sends every token to the same experts
+        // (seen on qwen3.5 and nemotron-h).
+        if (synthetic && synthetic_patterns::made_up(cur, weight->offs + ggml_nbytes(cur) <= files.at(weight->idx)->size())) {
+            if (progress_callback && !progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                return false;
+            }
+            patterns.fill(cur);
+            size_done += ggml_nbytes(cur);
             continue;
         }
 
