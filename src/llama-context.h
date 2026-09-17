@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-routing-stats.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"

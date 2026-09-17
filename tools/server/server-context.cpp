@@ -4664,6 +4664,59 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // slop fork: what the mixture-of-experts routing has looked like while this server ran. The
+    // counts live in libllama and are read under its own lock, so this needs no context and is
+    // answerable while the server sleeps.
+    this->get_routing = [this](const server_http_req &) {
+        auto res = create_response(true);
+
+        llama_routing_stats_data d;
+        if (!llama_routing_stats(&d)) {
+            res->ok({{"enabled", false}});
+            return res;
+        }
+
+        // prefill and decode are separate populations; each layer carries its own token totals
+        json kinds = json::object();
+        std::vector<int64_t> counts(d.n_expert);
+        const std::pair<llama_routing_kind, const char *> all[] = {
+            {LLAMA_ROUTING_PREFILL, "prefill"},
+            {LLAMA_ROUTING_DECODE,  "decode"},
+        };
+        for (const auto & [kind, name] : all) {
+            json layers = json::array();
+            for (int32_t i = 0; i < d.n_layer; i++) {
+                int32_t il = -1;
+                int64_t n_tokens = 0;
+                const int32_t n = llama_routing_stats_layer(kind, i, &il, &n_tokens, counts.data(), counts.size());
+                if (n <= 0) {
+                    continue;
+                }
+                layers.push_back({
+                    {"il",       il},
+                    {"n_tokens", n_tokens},
+                    {"counts",   std::vector<int64_t>(counts.begin(), counts.begin() + n)},
+                });
+            }
+            kinds[name] = {
+                {"n_ubatch_recorded", d.n_ubatch_recorded[kind]},
+                {"n_tokens",          d.n_tokens[kind]},
+                {"layers",            layers},
+            };
+        }
+
+        res->ok({
+            {"enabled",       true},
+            {"n_expert",      d.n_expert},
+            {"n_expert_used", d.n_expert_used},
+            {"n_ubatch_seen", d.n_ubatch_seen},
+            {"t_read_us",     d.t_read_us},
+            {"prefill",       kinds["prefill"]},
+            {"decode",        kinds["decode"]},
+        });
+        return res;
+    };
+
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response(true);
         if (!params.endpoint_metrics) {

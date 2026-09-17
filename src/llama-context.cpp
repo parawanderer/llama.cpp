@@ -140,6 +140,13 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    auto & routing = llama_routing_stats_recorder();
+    routing.configure((int32_t) hparams.n_expert, (int32_t) hparams.n_expert_used_max());
+    if (routing.on) {
+        LLAMA_LOG_INFO("%s: routing statistics on, one micro-batch per %lld ms of %d experts\n",
+                __func__, (long long) (routing.period_us / 1000), (int) hparams.n_expert);
+    }
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic
@@ -2546,9 +2553,23 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    // A recorded micro-batch borrows the scheduler's eval callback for the length of one compute
+    // call. It is not left installed: with a callback set, ggml computes the graph in pieces and
+    // synchronizes between them, which every micro-batch would otherwise pay for.
+    auto & routing = llama_routing_stats_recorder();
+    const bool record_routing = routing.begin(batched, cparams.cb_eval != nullptr);
+    if (record_routing) {
+        ggml_backend_sched_set_eval_callback(sched.get(), llama_routing_stats_eval_cb, &routing);
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    if (record_routing) {
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        routing.end();
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -4327,6 +4348,54 @@ void llama_perf_context_print(const llama_context * ctx) {
 
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
+}
+
+//
+// routing statistics (slop fork)
+//
+
+bool llama_routing_stats(llama_routing_stats_data * out) {
+    auto & rec = llama_routing_stats_recorder();
+    if (!rec.on) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(rec.mu);
+    out->n_expert      = rec.n_expert;
+    out->n_expert_used = rec.n_expert_used;
+    out->n_layer       = (int32_t) rec.layers.size();
+    out->n_ubatch_seen = rec.n_ubatch_seen;
+    out->t_read_us     = rec.t_read_us;
+    for (int k = 0; k < llama_routing_recorder::N_KIND; k++) {
+        out->n_ubatch_recorded[k] = rec.n_ubatch_recorded[k];
+        out->n_tokens[k]          = rec.n_tokens[k];
+    }
+    return true;
+}
+
+int32_t llama_routing_stats_layer(llama_routing_kind kind, int32_t idx, int32_t * il, int64_t * n_tokens, int64_t * counts, size_t n) {
+    auto & rec = llama_routing_stats_recorder();
+    std::lock_guard<std::mutex> lock(rec.mu);
+    if (idx < 0 || idx >= (int32_t) rec.layers.size() || kind < 0 || kind >= llama_routing_recorder::N_KIND) {
+        return -1;
+    }
+    auto it = rec.layers.begin();
+    std::advance(it, idx);
+    if (il) {
+        *il = it->first;
+    }
+    if (n_tokens) {
+        *n_tokens = it->second.n_tokens[kind];
+    }
+    const auto & c = it->second.counts[kind];
+    const size_t n_copy = std::min(n, c.size());
+    if (counts) {
+        std::copy(c.begin(), c.begin() + n_copy, counts);
+    }
+    return (int32_t) n_copy;
+}
+
+void llama_routing_stats_reset(void) {
+    llama_routing_stats_recorder().reset();
 }
 
 //

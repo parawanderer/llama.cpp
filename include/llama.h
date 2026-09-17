@@ -1606,6 +1606,65 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
     //
+    // Routing statistics (slop fork)
+    //
+    // With LLAMA_ROUTING_STATS set, a sampled share of micro-batches has its mixture-of-experts
+    // routing recorded: how many tokens each expert of each layer received. Trained routing is
+    // skewed and how skewed is not in the model's header, so a cost model for a mixture of experts
+    // has to measure it; this measures it from real traffic. Nothing about the tokens is kept.
+    //
+    // "off" or unset is off, "on" records at most one micro-batch per second, a number is that many
+    // milliseconds, and "0" records every micro-batch.
+
+    // Prefill (a micro-batch of more than one token) and decode (exactly one) are counted
+    // separately, because they are different token distributions and each has its own timer.
+
+    enum llama_routing_kind {
+        LLAMA_ROUTING_PREFILL = 0,
+        LLAMA_ROUTING_DECODE  = 1,
+    };
+
+    struct llama_routing_stats_data {
+        int32_t n_expert;               // experts per layer, 0 when the model is not a mixture
+        int32_t n_expert_used;          // the most any layer routes a token to
+        int32_t n_layer;                // layers that have recorded routing, indexable below
+        int64_t n_ubatch_seen;          // micro-batches offered, recorded or not
+        int64_t n_ubatch_recorded[2];   // indexed by llama_routing_kind
+        int64_t n_tokens[2];            // tokens whose routing went into the counts
+        int64_t t_read_us;              // time spent reading the routing back off the devices
+    };
+
+    // The counts are one set per process, not one per context: a context is freed when the server
+    // sleeps while a reader may be asking at that moment. ollama runs one llama-server per model,
+    // so per process is per model there. Creating a context for a model with a different number of
+    // experts clears what is held rather than adding to it. Reading is safe from any thread.
+    //
+    // The counts only ever grow, so a reader wanting a window subtracts two reads rather than
+    // asking the server to forget: nothing recorded between the two is then lost.
+
+    // false when the model is not a mixture of experts or recording is off
+    LLAMA_API bool llama_routing_stats(struct llama_routing_stats_data * out);
+
+    // Counts for the idx'th recorded layer, in increasing layer order, for one kind of micro-batch.
+    // Writes the layer's index to il, the tokens it routed to n_tokens, and up to n_expert counts
+    // to counts; returns how many counts it wrote, or -1 if idx is out of range. counts[e] is the
+    // number of tokens layer il routed to expert e.
+    //
+    // Divide by the layer's own n_tokens, not the total above: the last layer of a model routes
+    // only the tokens whose output is needed, so during prefill its router sees one token where
+    // every other layer sees the whole micro-batch.
+    LLAMA_API int32_t llama_routing_stats_layer(
+                enum llama_routing_kind   kind,
+                                int32_t   idx,
+                                int32_t * il,
+                                int64_t * n_tokens,
+                                int64_t * counts,
+                                 size_t   n);
+
+    // forget everything recorded so far, so a reader can take a window rather than a total
+    LLAMA_API void llama_routing_stats_reset(void);
+
+    //
     // training
     //
 
