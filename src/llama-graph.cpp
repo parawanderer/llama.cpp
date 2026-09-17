@@ -3908,7 +3908,11 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, kq_scale, il);
+    // n_kv_max, which upstream added to build_attn_mha: the most keys any row can leave
+    // unmasked, so flash attention can stop early. The mask here starts from top_k and is
+    // only ever narrowed by cand_mask and kq_mask, so the top-k width is the bound --
+    // the same value upstream's own top-k path passes (build_attn for DSA).
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
