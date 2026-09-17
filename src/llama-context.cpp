@@ -4372,7 +4372,7 @@ bool llama_routing_stats(llama_routing_stats_data * out) {
     return true;
 }
 
-int32_t llama_routing_stats_layer(llama_routing_kind kind, int32_t idx, int32_t * il, int64_t * n_tokens, int64_t * counts, size_t n) {
+int32_t llama_routing_stats_layer(llama_routing_kind kind, int32_t idx, llama_routing_layer_data * out, int64_t * counts, size_t n) {
     auto & rec = llama_routing_stats_recorder();
     std::lock_guard<std::mutex> lock(rec.mu);
     if (idx < 0 || idx >= (int32_t) rec.layers.size() || kind < 0 || kind >= llama_routing_recorder::N_KIND) {
@@ -4380,11 +4380,15 @@ int32_t llama_routing_stats_layer(llama_routing_kind kind, int32_t idx, int32_t 
     }
     auto it = rec.layers.begin();
     std::advance(it, idx);
-    if (il) {
-        *il = it->first;
-    }
-    if (n_tokens) {
-        *n_tokens = it->second.n_tokens[kind];
+    if (out) {
+        const auto & l = it->second;
+        const double b = l.sum_weight[kind] > 0 ? l.sum_weight[kind] : 1.0;
+        out->il          = it->first;
+        out->n_tokens    = l.n_tokens[kind];
+        out->n_batches   = l.n_batches[kind];
+        out->touched     = (float) (l.sum_touched[kind] / b);
+        out->eff_experts = (float) (l.sum_eff[kind]     / b);
+        out->busiest     = (float) (l.sum_busiest[kind] / b);
     }
     const auto & c = it->second.counts[kind];
     const size_t n_copy = std::min(n, c.size());

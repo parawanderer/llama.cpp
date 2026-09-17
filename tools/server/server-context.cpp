@@ -4686,16 +4686,19 @@ void server_routes::init_routes() {
         for (const auto & [kind, name] : all) {
             json layers = json::array();
             for (int32_t i = 0; i < d.n_layer; i++) {
-                int32_t il = -1;
-                int64_t n_tokens = 0;
-                const int32_t n = llama_routing_stats_layer(kind, i, &il, &n_tokens, counts.data(), counts.size());
+                llama_routing_layer_data l {};
+                const int32_t n = llama_routing_stats_layer(kind, i, &l, counts.data(), counts.size());
                 if (n <= 0) {
                     continue;
                 }
                 layers.push_back({
-                    {"il",       il},
-                    {"n_tokens", n_tokens},
-                    {"counts",   std::vector<int64_t>(counts.begin(), counts.begin() + n)},
+                    {"il",          l.il},
+                    {"n_tokens",    l.n_tokens},
+                    {"n_batches",   l.n_batches},
+                    {"touched",     l.touched},
+                    {"eff_experts", l.eff_experts},
+                    {"busiest",     l.busiest},
+                    {"counts",      std::vector<int64_t>(counts.begin(), counts.begin() + n)},
                 });
             }
             kinds[name] = {

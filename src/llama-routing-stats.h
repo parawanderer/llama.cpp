@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -50,6 +51,25 @@ struct llama_routing_recorder {
     struct layer {
         std::vector<int64_t> counts[N_KIND];   // tokens routed to each of the n_expert experts
         int64_t              n_tokens[N_KIND] = {0, 0};
+
+        // Summaries of each micro-batch on its own, summed so a mean survives without keeping
+        // every micro-batch. They are not recoverable from the pooled counts above and are the
+        // ones a cost model wants: a layer's popularity is redrawn per micro-batch, so pooling
+        // many of them averages that away and makes routing look more even than it is. Measured
+        // on lfm2.5:8b over seven micro-batches, the busiest expert was 6.2 times an even share
+        // per micro-batch and 4.9 times it pooled.
+        //
+        // Each is weighted by the micro-batch's tokens, not counted once: a two-token warmup
+        // batch and a 512-token prefill are the same row otherwise, and their shapes are not
+        // comparable. Where every micro-batch is the same size this is the plain mean.
+        // For decode these three carry nothing: one token picks k distinct experts, so touched is
+        // always k/E, effective experts always k, and busiest always E/k. Decode's pooled counts
+        // are the informative half -- they are what many single tokens did between them.
+        int64_t n_batches[N_KIND]   = {0, 0};
+        double  sum_weight[N_KIND]  = {0, 0}; // tokens behind the three sums below
+        double  sum_touched[N_KIND] = {0, 0}; // share of experts that got at least one token
+        double  sum_eff[N_KIND]     = {0, 0}; // effective experts, (sum c)^2 / sum c^2
+        double  sum_busiest[N_KIND] = {0, 0}; // busiest expert's tokens over an even share
     };
 
     // The last layer of a model routes only the tokens whose output is needed: llama.cpp puts a
@@ -64,8 +84,10 @@ struct llama_routing_recorder {
     int64_t n_tokens[N_KIND]           = {0, 0};
     int64_t t_read_us                  = 0; // time spent reading routing back off the devices
 
-    // staging for the read-back, touched only by the thread running the graph
+    // staging for the read-back and this micro-batch's own histogram, touched only by the thread
+    // running the graph
     std::vector<int32_t> staging;
+    std::vector<int64_t> batch;
 
     static bool parse_env(int64_t * period_us) {
         const char * v = getenv("LLAMA_ROUTING_STATS");
@@ -147,6 +169,26 @@ struct llama_routing_recorder {
         const int64_t n      = t->ne[1];
         const size_t  stride = t->nb[1] / sizeof(int32_t);
 
+        // this micro-batch on its own first, so its shape can be summarised before it is pooled
+        batch.assign(n_expert, 0);
+        for (int64_t i = 0; i < n; i++) {
+            const int32_t * row = staging.data() + (size_t) i * stride;
+            for (int64_t j = 0; j < k; j++) {
+                const int32_t e = row[j];
+                if (e >= 0 && e < n_expert) {
+                    batch[e]++;
+                }
+            }
+        }
+        double total = 0, sq = 0, busiest = 0, touched = 0;
+        for (int32_t e = 0; e < n_expert; e++) {
+            const double v = (double) batch[e];
+            total += v;
+            sq    += v * v;
+            busiest = std::max(busiest, v);
+            touched += v > 0 ? 1 : 0;
+        }
+
         std::lock_guard<std::mutex> lock(mu);
         // the whole micro-batch is one kind, even where the last layer sees fewer of its tokens
         const int which = recording;
@@ -155,14 +197,16 @@ struct llama_routing_recorder {
         if ((int32_t) c.size() != n_expert) {
             c.assign(n_expert, 0);
         }
-        for (int64_t i = 0; i < n; i++) {
-            const int32_t * row = staging.data() + (size_t) i * stride;
-            for (int64_t j = 0; j < k; j++) {
-                const int32_t e = row[j];
-                if (e >= 0 && e < n_expert) {
-                    c[e]++;
-                }
-            }
+        for (int32_t e = 0; e < n_expert; e++) {
+            c[e] += batch[e];
+        }
+        if (total > 0) {
+            const double w = (double) n;
+            lay.n_batches[which]++;
+            lay.sum_weight[which]  += w;
+            lay.sum_touched[which] += w * (touched / n_expert);
+            lay.sum_eff[which]     += w * (total * total / sq);
+            lay.sum_busiest[which] += w * (busiest / (total / n_expert));
         }
         lay.n_tokens[which] += n;
         // the micro-batch's own tokens are counted once, on whichever layer routes first

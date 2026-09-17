@@ -1645,21 +1645,38 @@ extern "C" {
     // false when the model is not a mixture of experts or recording is off
     LLAMA_API bool llama_routing_stats(struct llama_routing_stats_data * out);
 
-    // Counts for the idx'th recorded layer, in increasing layer order, for one kind of micro-batch.
-    // Writes the layer's index to il, the tokens it routed to n_tokens, and up to n_expert counts
-    // to counts; returns how many counts it wrote, or -1 if idx is out of range. counts[e] is the
-    // number of tokens layer il routed to expert e.
+    struct llama_routing_layer_data {
+        int32_t il;         // the layer's index in the model
+        int64_t n_tokens;   // tokens this layer routed
+        int64_t n_batches;  // micro-batches it routed them in
+
+        // Means over those micro-batches, each computed on one micro-batch before it was pooled,
+        // and weighted by that micro-batch's tokens. They are not recoverable from the counts: a
+        // layer's expert popularity is redrawn per micro-batch, so pooling many averages that away
+        // and routing looks more even than it is.
+        //
+        // For LLAMA_ROUTING_DECODE they carry nothing: one token picks k distinct experts, so
+        // touched is always k/E, eff_experts always k and busiest always E/k. Decode's informative
+        // half is its pooled counts -- what many single tokens did between them.
+        float touched;      // share of experts that got at least one token
+        float eff_experts;  // effective experts, (sum c)^2 / sum c^2
+        float busiest;      // the busiest expert's tokens over an even share
+    };
+
+    // Statistics for the idx'th recorded layer, in increasing layer order, for one kind of
+    // micro-batch. Fills out, and writes up to n_expert pooled counts to counts, where counts[e] is
+    // the tokens layer il routed to expert e over all its micro-batches. Returns how many counts it
+    // wrote, or -1 if idx is out of range.
     //
     // Divide by the layer's own n_tokens, not the total above: the last layer of a model routes
     // only the tokens whose output is needed, so during prefill its router sees one token where
     // every other layer sees the whole micro-batch.
     LLAMA_API int32_t llama_routing_stats_layer(
-                enum llama_routing_kind   kind,
-                                int32_t   idx,
-                                int32_t * il,
-                                int64_t * n_tokens,
-                                int64_t * counts,
-                                 size_t   n);
+                    enum llama_routing_kind   kind,
+                                    int32_t   idx,
+            struct llama_routing_layer_data * out,
+                                    int64_t * counts,
+                                     size_t   n);
 
     // forget everything recorded so far, so a reader can take a window rather than a total
     LLAMA_API void llama_routing_stats_reset(void);
